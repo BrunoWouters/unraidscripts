@@ -1,0 +1,96 @@
+#!/bin/bash
+# Add containers below to skip e.g.: containersToSkip=("redis")
+containersToSkip=()
+
+# lock to prevent concurrent backup runs to the same storage (no perfect solution but seems adequate)
+# ajust lock filename as you seem fit if you have multiple scripts to the same storage.
+# https://stackoverflow.com/a/185473/1388019
+lockfile="/tmp/backups-duplicacy.lock"
+
+if [ -e ${lockfile} ] && kill -0 `cat ${lockfile}`; then
+    echo "Duplicacy for backups storage is already running"
+    exit
+fi
+
+# make sure the lockfile is removed when we exit and then claim it
+trap "rm -f ${lockfile}; exit" INT TERM EXIT
+echo $$ > ${lockfile}
+
+
+# get the order of the containers in the Unraid Docker tab
+mapfile orderedContainersUserPrefs < /boot/config/plugins/dockerMan/userprefs.cfg
+
+# get the running containers
+mapfile -t runningContainers < <( docker inspect --format='{{.Name}}' $(docker ps -q --no-trunc) | cut -c2- )
+
+# create a clean list of the ordered containers
+containersInStartingOrder=()
+for container in "${orderedContainersUserPrefs[@]}"; do
+    # keep only the container name (0="redis")
+    container=$(awk -F'="|"' '{print $2}' <<< "$container")
+    
+    # skip folders
+    if [[ $container == folder-* ]] ;
+    then
+      echo "$container: Skip folder"
+      continue
+    fi
+    if [[ ${containersToSkip[@]} =~ $container ]]
+    then
+      echo "$container: Skipping this container as it is on the skiplist"
+      continue
+    fi
+    containersInStartingOrder+=($container)
+done
+
+# create a reversed list to stop the containers in the correct order
+containersInStoppingOrder=()
+for ((i=${#containersInStartingOrder[@]}-1; i>=0; i--)); do
+    containersInStoppingOrder+=("${containersInStartingOrder[i]}")
+done
+
+# stop containers in the correct order
+for container in "${containersInStoppingOrder[@]}"; do
+    if [[ ${runningContainers[@]} =~ $container ]]
+    then
+      echo "$container: stopping"
+      docker stop ${container} 1> /dev/null
+      echo "$container: stopped"
+    else
+      echo "$container: already stopped"
+    fi
+done
+
+echo "Copying appdata to backups share"
+rsync -a --delete /mnt/user/appdata/ /mnt/user/backups/appdata/
+echo "Copy completed succesfully"
+
+# start containers in the correct order
+for container in "${containersInStartingOrder[@]}"; do
+    if [[ ${runningContainers[@]} =~ $container ]]
+    then
+      echo "$container: starting"
+      docker start ${container} 1> /dev/null
+      echo "$container: started"
+    else
+      echo "$container: was already stopped so will not be started"
+    fi
+done
+
+echo "Copying flashdrive to backups share"
+rsync -avXHg --delete /boot/ /mnt/user/backups/unraidflash
+chmod 777 -R /mnt/user/backups/unraidflash
+echo "Copy completed succesfully"
+
+echo "Starting backup"
+cd /mnt/user/backups
+/usr/local/bin/duplicacy -log backup -threads 2 -stats
+echo "Backup complete"
+
+echo "Starting pruning"
+duplicacy prune -keep 0:360 -keep 30:180 -keep 7:30 -keep 1:7
+echo "Pruning complete"
+
+echo "Releasing lockfile"
+# clean up lockfile
+rm -f ${lockfile}
